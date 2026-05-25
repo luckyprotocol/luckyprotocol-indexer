@@ -1,0 +1,67 @@
+[package]
+name = "luckyprotocol-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "Global LUCKYPROTOCOL protocol indexer — watches a Bitcoin chain via Esplora REST, parses LUCKYPROTOCOL OP_RETURN payloads, derives token balances per UTXO, exposes a JSON HTTP API."
+authors = ["LUCKYPROTOCOL"]
+
+[[bin]]
+name = "luckyprotocol-indexer"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# HTTP client (Esplora REST). `http2` feature is REQUIRED for the
+# `http2_adaptive_window` / `http2_keep_alive_*` knobs in build_http_client
+# — without it those ClientBuilder methods don't compile. With the feature
+# enabled, reqwest negotiates HTTP/2 via TLS ALPN automatically (no code
+# change at the call site), so 128 concurrent fetches multiplex over
+# ~1-2 TCP connections instead of opening a fresh socket per request.
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "http2"], default-features = false }
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Bitcoin
+bitcoin = "0.32"
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Non-blocking writer for tracing output. Without this, every
+# `tracing::info!` / `warn!` / `error!` call writes synchronously to
+# stdout — which can BLOCK if the consuming side (Tauri's sidecar
+# stdout drain task, or the OS pipe buffer) is slow to drain or
+# wedged. We've observed exactly that wedge: the indexer's poll loop
+# silently froze for 5+ hours because its tracing call inside the
+# loop blocked on a stuck stdout write — the v8 watchdog couldn't
+# even record the wedge because pushing the diagnostic ErrorEvent
+# also did a tracing::error! which blocked on the same dead writer.
+# `tracing_appender::non_blocking` swaps in a bounded channel + a
+# dedicated worker thread; log calls now return in <1µs and any
+# slow downstream is observed as "log lines dropped" instead of a
+# whole-process freeze.
+tracing-appender = "0.2"
+
+# CLI args
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Concurrency primitives
+parking_lot = "0.12"
+
+# Futures stream combinators — used by source.rs::backfill_range to fan
+# out concurrent per-tx HTTP fetches under a semaphore-bounded concurrency
+# limit.
+futures = "0.3"
