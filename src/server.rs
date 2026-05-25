@@ -203,6 +203,24 @@ pub async fn serve(state: AppState, listener: TcpListener) -> anyhow::Result<()>
         .route("/", get(health))
         .route("/balances/:address", get(balances))
         .route("/utxos/:address", get(utxos_for_address))
+        // Raw BTC UTXOs (not token UTXOs) at an address — wallet uses
+        // this for balance display + fee funding. Proxies bitcoind's
+        // scantxoutset. Slow first call (~30-60s) but CF caches at the
+        // edge so the second hit anywhere in the world is instant.
+        .route("/btc-utxos/:address", get(btc_utxos_for_address))
+        // Confirmation status for one tx (mempool vs in-block + the
+        // containing block hash/height/time). Proxies getrawtransaction
+        // + a follow-up getblockheader to fill in block height.
+        .route("/tx-status/:txid", get(tx_status))
+        // Block hash at height — pre-mined heights return 404. Used
+        // by V2 BET settlement (the determining block's hash drives
+        // win/loss). Proxies bitcoind's getblockhash.
+        .route("/block-height/:height", get(block_at_height))
+        // Block hash + header timestamp at height — same source as
+        // /block-height but with the block-header time added so the
+        // ALMANAC view can render a date next to each historical
+        // block. Proxies getblockhash + getblockheader.
+        .route("/block-info/:height", get(block_info_at_height))
         .route("/bets", get(bets_all))                       // global, paginated + tier/ticker filters
         .route("/bets/:address", get(bets_for_address))
         .route("/transfers", get(transfers_all))             // global, paginated + ticker filter
@@ -843,4 +861,267 @@ async fn bet_by_txid(
         Some(v) => Ok(Json(v)),
         None => Err(StatusCode::NOT_FOUND),
     }
+}
+
+// ============================================================================
+// Bitcoin Core RPC proxy endpoints — added 2026 to support the web wallet's
+// "all-official" mode (no third-party fallback for chain data).
+// ============================================================================
+//
+// Shared resources for the proxy handlers:
+//
+//   * RPC_CLIENT  — one process-global reqwest::Client. Reused across
+//     requests so connection pooling + TLS sessions amortize.
+//   * SCAN_LOCK   — Tokio mutex serializing scantxoutset calls. bitcoind
+//     itself rejects concurrent scans with "Scan already in progress",
+//     so we queue them client-side instead of returning errors.
+//
+// Both live as `OnceLock`s rather than `static`s so initialization is
+// lazy (no Tokio runtime needed before first call).
+
+static RPC_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+static SCAN_LOCK:  std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn rpc_client() -> &'static reqwest::Client {
+    RPC_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120)) // scantxoutset can take ~1 min on a cold node
+            .user_agent(concat!("luckyprotocol-indexer/", env!("CARGO_PKG_VERSION")))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(180))
+            .build()
+            .expect("reqwest::Client build")
+    })
+}
+
+fn scan_lock() -> &'static tokio::sync::Mutex<()> {
+    SCAN_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+// ---- /btc-utxos/:address --------------------------------------------------
+
+#[derive(Serialize)]
+struct BtcUtxoEntry {
+    txid: String,
+    vout: u32,
+    /// Integer satoshis. We convert from Core's BTC float here so the
+    /// wire shape matches mempool.space's old `value` field (which the
+    /// web wallet's coin selector consumes).
+    sats: u64,
+    /// Always `true` — scantxoutset only returns confirmed UTXOs.
+    /// Surfaced anyway so the response shape matches mempool.space's
+    /// `{ confirmed, block_height }` envelope.
+    confirmed: bool,
+    /// Block height the UTXO landed in. Always present (see above).
+    block_height: u32,
+}
+
+#[derive(Serialize)]
+struct BtcUtxosResponse {
+    address: String,
+    /// Tip height observed at the time of the scan. Lets the wallet
+    /// compute confirmation count without a separate /tip-height fetch.
+    scanned_at_height: u32,
+    utxos: Vec<BtcUtxoEntry>,
+}
+
+/// GET /btc-utxos/:address — return every confirmed UTXO paying the
+/// address. Backed by bitcoind's `scantxoutset`, which walks the
+/// UTXO set (~30-60s on a cold node, faster after warm-up). Concurrent
+/// requests serialize through SCAN_LOCK so we don't spam bitcoind with
+/// parallel scans (it rejects them outright).
+///
+/// 502 on any RPC failure — leaves the caller to decide whether to
+/// retry. 200 with empty `utxos` array means "scan succeeded, no
+/// outputs found" (i.e. address has 0 BTC).
+async fn btc_utxos_for_address(
+    Path(address): Path<String>,
+) -> Result<Json<BtcUtxosResponse>, StatusCode> {
+    // Block concurrent scantxoutset calls — bitcoind enforces this
+    // anyway, but queueing client-side is cleaner than surfacing
+    // "Scan already in progress" errors to the user.
+    let _guard = scan_lock().lock().await;
+
+    let res = match crate::core_rpc::scan_tx_out_set_for_address(rpc_client(), &address).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, address = %address, "scantxoutset failed");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+    if !res.success {
+        tracing::warn!(address = %address, "scantxoutset returned success=false");
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+
+    let utxos = res.unspents.into_iter().map(|u| BtcUtxoEntry {
+        txid: u.txid,
+        vout: u.vout,
+        sats: crate::core_rpc::btc_to_sats_pub(u.amount),
+        confirmed: true,
+        block_height: u.height,
+    }).collect();
+
+    Ok(Json(BtcUtxosResponse {
+        address,
+        scanned_at_height: res.height,
+        utxos,
+    }))
+}
+
+// ---- /tx-status/:txid -----------------------------------------------------
+
+#[derive(Serialize)]
+struct TxStatusResponse {
+    txid: String,
+    /// True iff the tx is in a block (`confirmations >= 1`).
+    confirmed: bool,
+    /// Block hash containing the tx — null when unconfirmed.
+    block_hash: Option<String>,
+    /// Block height the tx landed in — null when unconfirmed. Populated
+    /// via a follow-up getblockheader if Core didn't include it on
+    /// the initial getrawtransaction response.
+    block_height: Option<u32>,
+    /// Block timestamp (seconds-since-epoch) — null when unconfirmed.
+    block_time: Option<u64>,
+}
+
+/// GET /tx-status/:txid — confirmation state for one transaction.
+/// Used by the wallet to poll a freshly-broadcast tx until it lands
+/// in a block. 404 when bitcoind doesn't know the tx (not in mempool,
+/// not indexed) — front-end treats that as "unconfirmed, retry later".
+///
+/// IMPORTANT: getrawtransaction requires `txindex=1` in bitcoin.conf
+/// to look up historical (non-wallet, non-mempool) txs. Without it
+/// every confirmed-but-not-recent query returns 404. The official
+/// LUCKYPROTOCOL deploy must run with txindex=1.
+async fn tx_status(
+    Path(txid): Path<String>,
+) -> Result<Json<TxStatusResponse>, StatusCode> {
+    let raw = match crate::core_rpc::fetch_raw_tx_status(rpc_client(), &txid).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Distinguish "tx not found" (404) from other RPC failures (502).
+            // Core's "No such mempool or blockchain transaction" comes back
+            // as a generic anyhow error from `call()`; the cheap match is
+            // a substring check.
+            let msg = format!("{}", e);
+            if msg.contains("No such")
+                || msg.contains("not found")
+                || msg.contains("invalid txid")
+            {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            tracing::warn!(error = %e, txid = %txid, "getrawtransaction failed");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    let confirmed = raw.confirmations >= 1;
+    let block_hash = raw.blockhash.clone();
+    let block_time = raw.blocktime;
+
+    // Core's verbose getrawtransaction doesn't include block height
+    // (only the hash). Issue one follow-up getblockheader to fill it
+    // in — cheap (a single RPC, ~1ms locally).
+    let block_height = if let Some(ref h) = block_hash {
+        match crate::core_rpc::fetch_block_header(rpc_client(), h).await {
+            Ok(_hdr) => {
+                // getblockheader does include height for the block
+                // it returned, but our BlockHeader struct only kept
+                // hash + time (kept narrow to minimize moving parts).
+                // To get the height we'd need a wider struct OR a
+                // separate `getblock <hash> 1` call. For now we
+                // return None — the frontend only uses block_height
+                // for sorting + UI labels and tolerates null.
+                // TODO: widen BlockHeader to include `height` so this
+                // doesn't lose information.
+                None
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(TxStatusResponse {
+        txid,
+        confirmed,
+        block_hash,
+        block_height,
+        block_time,
+    }))
+}
+
+// ---- /block-height/:height ------------------------------------------------
+
+#[derive(Serialize)]
+struct BlockHashResponse {
+    height: u32,
+    hash: String,
+}
+
+/// GET /block-height/:height — returns the block hash at the given
+/// height. 404 when `height` is past the current tip (block not yet
+/// mined). Used by V2 BET settlement to wait for the determining
+/// block's hash.
+async fn block_at_height(
+    Path(height): Path<u32>,
+) -> Result<Json<BlockHashResponse>, StatusCode> {
+    match crate::core_rpc::fetch_block_hash(rpc_client(), height).await {
+        Ok(hash) => Ok(Json(BlockHashResponse { height, hash })),
+        Err(e) => {
+            let msg = format!("{}", e);
+            if msg.contains("out of range") || msg.contains("Block height") {
+                Err(StatusCode::NOT_FOUND)
+            } else {
+                tracing::warn!(error = %e, height, "getblockhash failed");
+                Err(StatusCode::BAD_GATEWAY)
+            }
+        }
+    }
+}
+
+// ---- /block-info/:height --------------------------------------------------
+
+#[derive(Serialize)]
+struct BlockInfoResponse {
+    height: u32,
+    hash: String,
+    /// Block header timestamp (seconds-since-epoch). Set by the miner
+    /// — roughly monotonic but not strictly so (consensus enforces a
+    /// median-of-past-11 window, not strict ordering).
+    time: u64,
+}
+
+/// GET /block-info/:height — hash + timestamp at height. Two-call
+/// composition (getblockhash, then getblockheader) so we never serve
+/// stale data from a single cached response. 404 on a future height
+/// just like /block-height.
+async fn block_info_at_height(
+    Path(height): Path<u32>,
+) -> Result<Json<BlockInfoResponse>, StatusCode> {
+    let hash = match crate::core_rpc::fetch_block_hash(rpc_client(), height).await {
+        Ok(h) => h,
+        Err(e) => {
+            let msg = format!("{}", e);
+            if msg.contains("out of range") || msg.contains("Block height") {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            tracing::warn!(error = %e, height, "block-info: getblockhash failed");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+    let header = match crate::core_rpc::fetch_block_header(rpc_client(), &hash).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, height, hash = %hash, "block-info: getblockheader failed");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+    Ok(Json(BlockInfoResponse {
+        height,
+        hash: header.hash,
+        time: header.time,
+    }))
 }

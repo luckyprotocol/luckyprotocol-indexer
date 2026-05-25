@@ -121,6 +121,130 @@ pub async fn fetch_block_hash(client: &reqwest::Client, height: u32) -> Result<S
     Ok(hash)
 }
 
+/// Result of `getblockheader <hash>` (verbose=true). We only consume
+/// the timestamp for the indexer's /block-info endpoint; the rest of
+/// the fields exist on the wire but go unused.
+#[derive(Debug, Deserialize)]
+pub struct BlockHeader {
+    /// Hash again — Core echoes it; keep it so callers don't have to
+    /// re-thread the input hash through the result type.
+    pub hash: String,
+    /// Block-header timestamp (seconds-since-epoch). The miner sets
+    /// this; consensus rules require it to fit a "median of past 11"
+    /// window so it's roughly monotonic but NOT strictly so.
+    pub time: u64,
+}
+
+/// `getblockheader <hash> true` — header-only metadata (no full
+/// transaction list). Used by `/block-info/:height` to answer
+/// "what is the timestamp of the block at this height?" with a
+/// single RPC round-trip.
+pub async fn fetch_block_header(
+    client: &reqwest::Client,
+    block_hash: &str,
+) -> Result<BlockHeader> {
+    let cfg = config().ok_or_else(|| anyhow!("core-rpc not configured"))?;
+    call(client, cfg, "getblockheader", json!([block_hash, true])).await
+}
+
+/// Result of `getrawtransaction <txid> true` (the verbose form). We
+/// surface only the fields the indexer's /tx-status endpoint exposes;
+/// the verbose response carries more (vin/vout/hex/etc.) but we don't
+/// need it here — the protocol indexer's own bet/transfer logs answer
+/// the "what did this tx do?" question, /tx-status only answers
+/// "did it confirm yet?".
+#[derive(Debug, Deserialize)]
+pub struct RawTxStatus {
+    /// Hash of the block this tx landed in. Absent / empty when the
+    /// tx is in the mempool (unconfirmed).
+    #[serde(default)]
+    pub blockhash: Option<String>,
+    /// Number of confirmations so far. 0 = mempool, >=1 = in a block.
+    /// Older Core versions sometimes omit this for unconfirmed txs;
+    /// we default to 0.
+    #[serde(default)]
+    pub confirmations: u32,
+    /// Block timestamp (seconds-since-epoch). Absent when unconfirmed.
+    #[serde(default)]
+    pub blocktime: Option<u64>,
+}
+
+/// `getrawtransaction <txid> true` — verbose form, includes block
+/// hash + confirmations. Note: requires `txindex=1` in bitcoin.conf
+/// for non-wallet, non-mempool txs — without it, Core returns
+/// `"No such mempool or blockchain transaction"` for any historical
+/// tx the node hasn't indexed. The official LUCKYPROTOCOL deploy is
+/// expected to run with txindex=1.
+pub async fn fetch_raw_tx_status(
+    client: &reqwest::Client,
+    txid: &str,
+) -> Result<RawTxStatus> {
+    let cfg = config().ok_or_else(|| anyhow!("core-rpc not configured"))?;
+    call(client, cfg, "getrawtransaction", json!([txid, true])).await
+}
+
+/// One unspent output as returned by `scantxoutset`. The fields we
+/// keep are the bare minimum the wallet needs for coin selection
+/// (txid + vout outpoint, value in BTC, block height of the
+/// containing block).
+#[derive(Debug, Deserialize)]
+pub struct ScanTxOutEntry {
+    pub txid: String,
+    pub vout: u32,
+    /// Value as BTC (float). Callers convert to sats with `btc_to_sats`.
+    pub amount: f64,
+    /// Height of the block this UTXO landed in. `scantxoutset` only
+    /// returns confirmed UTXOs, so this is always populated for a
+    /// successful scan.
+    pub height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScanTxOutResult {
+    /// True if the scan ran to completion. False can mean an in-flight
+    /// scan was aborted, the descriptor was malformed, or the node is
+    /// still in IBD and refused.
+    pub success: bool,
+    /// Tip height the UTXO set was scanned at.
+    #[serde(default)]
+    pub height: u32,
+    /// The UTXOs themselves.
+    #[serde(default)]
+    pub unspents: Vec<ScanTxOutEntry>,
+}
+
+/// `scantxoutset start [{"desc": "addr(<address>)"}]` — scan the
+/// UTXO set for outputs paying the given address. Slow on first call
+/// (~30-60s, walks the whole UTXO set) but cacheable for subsequent
+/// requests within the CF edge-cache window.
+///
+/// scantxoutset is serialized at the bitcoind level — only one scan
+/// can run at a time across all callers. The caller in server.rs
+/// wraps invocations in a Tokio Mutex to queue concurrent requests
+/// so we don't fire-and-fail on each one.
+pub async fn scan_tx_out_set_for_address(
+    client: &reqwest::Client,
+    address: &str,
+) -> Result<ScanTxOutResult> {
+    let cfg = config().ok_or_else(|| anyhow!("core-rpc not configured"))?;
+    // The "addr(...)" descriptor matches any output whose
+    // scriptpubkey decodes to the given address. Works for every
+    // standard address type Bitcoin Core understands (p2pkh, p2sh,
+    // p2wpkh, p2wsh, p2tr).
+    let descriptors = json!([{ "desc": format!("addr({})", address) }]);
+    let res: ScanTxOutResult = call(
+        client, cfg, "scantxoutset", json!(["start", descriptors]),
+    ).await?;
+    Ok(res)
+}
+
+/// Convert a BTC-denominated float (as serialized by Bitcoin Core's
+/// JSON-RPC) to integer satoshis. Made pub so callers in server.rs
+/// can use the same conversion path as the indexer's getblock parser.
+pub fn btc_to_sats_pub(btc: f64) -> u64 {
+    btc_to_sats(btc)
+}
+
 /// Result of `getblock <hash> 3` — full transactions with prevout
 /// metadata included on every vin. The shape differs from Esplora's
 /// `/block/:hash/txs[/:idx]` so we map fields in the adapter below.
