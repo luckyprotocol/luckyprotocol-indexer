@@ -1,17 +1,18 @@
-// Bitcoin Core JSON-RPC adapter.
-// When the user has a self-hosted full node, we'd rather hit `getblock
-// <hash> 3` than walk through Esplora's paginated `/block/:hash/txs`.
-// One RPC call returns every transaction in the block — including
-// `prevout` metadata (vin value + scriptPubKey) — so backfill goes
-// from ~50 HTTP requests per block down to 2 (getblockhash + getblock).
+// Bitcoin Core JSON-RPC adapter — the ONLY chain source for this indexer.
+//
+// One `getblock <hash> 3` call returns every transaction in the block —
+// including `prevout` metadata (vin value + scriptPubKey) — so backfill
+// runs at "as fast as the local node can serialize JSON", with no
+// rate limits and no third-party trust.
+//
 // Requires Bitcoin Core 24.0+ for `verbosity=3` (released 2022-12).
-// If the user's node is older, the adapter falls back gracefully —
-// `fetch_block_txs_all` returns an error and the caller routes to the
-// Esplora chain.
-// Configuration is global (`CORE_RPC`) so the source.rs fetch_*
-// helpers can probe it without threading config through every call
-// site. main.rs sets the OnceLock once on startup; the rest of the
-// program treats it as immutable.
+// If the user's node is older, `fetch_block_all_txs` errors and the
+// indexer halts — there is no Esplora fallback in this binary.
+//
+// Configuration is global (`CORE_RPC`) so source.rs helpers can read
+// it without threading config through every call site. main.rs sets
+// the OnceLock once on startup; the rest of the program treats it
+// as immutable.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -25,10 +26,9 @@ use serde_json::{json, Value};
 /// node that's down without stalling the pipeline.
 const RPC_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Global Bitcoin Core RPC configuration, set once by `main.rs` if the
-/// user passed `--core-url`. Reads are lock-free. When unset, every
-/// `is_configured()` callsite returns false and the indexer behaves
-/// exactly as before (pure Esplora).
+/// Global Bitcoin Core RPC configuration, set once by `main.rs` from
+/// the required `--core-url` / `--core-user` / `--core-password` CLI
+/// args. Reads are lock-free.
 pub static CORE_RPC: OnceLock<CoreRpcConfig> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -40,10 +40,6 @@ pub struct CoreRpcConfig {
     pub url: String,
     pub user: String,
     pub password: String,
-}
-
-pub fn is_configured() -> bool {
-    CORE_RPC.get().is_some()
 }
 
 pub fn config() -> Option<&'static CoreRpcConfig> {
@@ -283,16 +279,35 @@ pub async fn fetch_block_all_txs(
     Ok((out, block.merkleroot, n_tx))
 }
 
-/// Probe — issue `getblockchaininfo` to confirm the node is reachable
-/// and unlocked. Called once on startup; on error we log a warning
-/// and leave the indexer falling back to Esplora forever. Cheap (a
-/// few KB JSON) and only runs once.
-pub async fn probe(client: &reqwest::Client) -> Result<u32> {
+/// Subset of `getblockchaininfo` we care about. Used by callers that
+/// want to distinguish "Core is fully synced" from "Core is still in
+/// IBD" — relevant because the indexer can advance no further than
+/// `blocks` (the node's current verified tip), and during IBD that's
+/// often far below `headers` (the known best chain).
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // Fields read by future /state JSON surfacing.
+pub struct BlockchainInfo {
+    /// Verified tip height — the latest block whose state Core has
+    /// applied. Equal to `headers` once IBD finishes.
+    pub blocks: u32,
+    /// Highest known header height — set by the headers-first download
+    /// phase. During IBD this is the true chain tip while `blocks`
+    /// catches up; afterwards the two stay equal.
+    pub headers: u32,
+    /// True iff Core considers itself still in Initial Block Download.
+    /// While true the indexer should NOT trust `blocks` as the chain
+    /// tip for scan purposes — it should wait (or scan slowly, knowing
+    /// the tip will advance steadily).
+    #[serde(rename = "initialblockdownload")]
+    pub initial_block_download: bool,
+}
+
+/// One-shot `getblockchaininfo` call. Used by the poll loop to detect
+/// IBD state — when the node is still syncing, our derived state is
+/// only as fresh as the node's verified tip, and the operator log
+/// should reflect that distinction.
+#[allow(dead_code)] // Surfaced via the HTTP server's /state endpoint when wired in.
+pub async fn fetch_blockchain_info(client: &reqwest::Client) -> Result<BlockchainInfo> {
     let cfg = config().ok_or_else(|| anyhow!("core-rpc not configured"))?;
- #[derive(Deserialize)]
-    struct Info {
-        blocks: u32,
-    }
-    let info: Info = call(client, cfg, "getblockchaininfo", json!([])).await?;
-    Ok(info.blocks)
+    call(client, cfg, "getblockchaininfo", json!([])).await
 }

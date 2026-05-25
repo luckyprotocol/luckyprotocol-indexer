@@ -68,7 +68,11 @@ type AppState = Arc<RwLock<IndexerState>>;
 #[derive(Serialize)]
 struct Health {
     network: String,
-    esplora_base: String,
+    /// Configured Bitcoin Core JSON-RPC endpoint — surfaces "where is
+    /// this indexer's chain data coming from?" in the `/` health JSON.
+    /// Pulled from the `CORE_RPC` OnceCell rather than IndexerState
+    /// since the URL is process-config, not derived state.
+    core_url: String,
     indexed_height: u32,
     tip_height: u32,
     address_count: usize,
@@ -295,7 +299,9 @@ async fn health(State(state): State<AppState>) -> Json<Health> {
                 && elapsed > crate::indexer::STALL_THRESHOLD_SECS;
         Health {
             network: format!("{}", s.network).to_lowercase(),
-            esplora_base: s.esplora_base.clone(),
+            core_url: crate::core_rpc::config()
+                .map(|c| c.url.clone())
+                .unwrap_or_default(),
             indexed_height: s.indexed_height,
             tip_height: s.tip_height,
  // Under v2, "addresses with non-zero balance" comes from the

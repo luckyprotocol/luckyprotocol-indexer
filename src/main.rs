@@ -2,33 +2,42 @@
 // Standalone binary that watches Bitcoin mainnet, parses LUCKYPROTOCOL
 // OP_RETURN payloads, replays the protocol rules, and serves the derived
 // per-address token balances + bet history via a JSON HTTP API.
+//
 // Endpoints:
-// GET / — health + tip / scan state
-// GET /balances/:address — { ticker: amount } map
-// GET /bets/:address — list of bets known to involve this address
-// GET /bets/by-txid/:txid — single bet record by tx
+//   GET /                — health + tip / scan state
+//   GET /balances/:addr  — { ticker: amount } map
+//   GET /bets/:addr      — list of bets known to involve this address
+//   GET /bets/by-txid/:txid — single bet record by tx
+//
 // Operational model:
 // * On startup, attempts to restore from the latest disk snapshot at
-// `--snapshot-path`. If present, indexing resumes from snapshot.height + 1
-// instead of re-scanning from LCKPROTOCOL_START_HEIGHT.
+//   `--snapshot-path`. If present, indexing resumes from snapshot.height + 1
+//   instead of re-scanning from LCKPROTOCOL_START_HEIGHT.
 // * Otherwise, scans from `--start-height` (default: LCKPROTOCOL_START_HEIGHT)
-// up to the current tip, parsing every OP_RETURN. Stores derived state
-// in-memory + writes a fresh snapshot to disk every SNAPSHOT_INTERVAL_BLOCKS.
-// * After catch-up, polls `/blocks/tip/height` every 30s; on new tip,
-// fetches the block(s) + applies any new LUCKYPROTOCOL payloads.
+//   up to the current tip, parsing every OP_RETURN. Stores derived state
+//   in-memory + writes a fresh snapshot to disk every SNAPSHOT_INTERVAL_BLOCKS.
+// * After catch-up, polls Bitcoin Core's tip height every `--poll-secs`
+//   seconds; on new tip, fetches the block(s) + applies any new LUCKYPROTOCOL
+//   payloads.
 // * Reorg-aware: probes the last 12 blocks on every poll; on divergence,
-// restores from the most recent valid in-memory snapshot and re-scans
-// forward from there (NOT a full rewind to genesis).
+//   restores from the most recent valid in-memory snapshot and re-scans
+//   forward from there (NOT a full rewind to genesis).
+//
+// Transport: ONLY Bitcoin Core JSON-RPC. There is no Esplora / Alchemy /
+// mempool.space fallback. Self-sovereign by construction — every byte of
+// chain data comes from a node the operator controls. If you don't run
+// your own node, you don't get to run this indexer.
+//
 // Protocol rules (must stay in lockstep with src/protocol/protocol.js +
 // src-tauri/src/tx.rs):
-// BET payload: LUCKYPROTOCOL|<tier>|<pick>|<ticker>|<win_out_idx>
-// -> if isHit(tier, pick, hash_N) is true, the UTXO at
-// (txid, win_out_idx) is credited with TIER_REWARD[tier] of <ticker>.
-// SEND payload: LUCKYPROTOCOL|SEND|<ticker>|<amount>|<to_out_idx>[|<change_out_idx>]
-// -> drain input pool, credit to_out_idx by <amount>, route residual
-// to change_out_idx (or burn if absent).
-// DEPLOY payload: LUCKYPROTOCOL|DEPLOY|<ticker>
-// -> first-write-wins ticker registration.
+//   BET payload: LUCKYPROTOCOL|<tier>|<pick>|<ticker>|<win_out_idx>
+//     -> if isHit(tier, pick, hash_N) is true, the UTXO at
+//        (txid, win_out_idx) is credited with TIER_REWARD[tier] of <ticker>.
+//   SEND payload: LUCKYPROTOCOL|SEND|<ticker>|<amount>|<to_out_idx>[|<change_out_idx>]
+//     -> drain input pool, credit to_out_idx by <amount>, route residual
+//        to change_out_idx (or burn if absent).
+//   DEPLOY payload: LUCKYPROTOCOL|DEPLOY|<ticker>
+//     -> first-write-wins ticker registration.
 
 mod core_rpc;
 mod indexer;
@@ -43,101 +52,76 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(version, about)]
 struct Cli {
- /// Network the indexer watches. Mainnet only — testnet/signet were
- /// dropped from the LUCKYPROTOCOL project. Kept as a CLI knob for
- /// symmetry only.
- #[arg(long, env = "LUCKYPROTOCOL_NETWORK", default_value = "bitcoin")]
+    /// Network the indexer watches. Mainnet only — testnet/signet were
+    /// dropped from the LUCKYPROTOCOL project. Kept as a CLI knob for
+    /// symmetry only.
+    #[arg(long, env = "LUCKYPROTOCOL_NETWORK", default_value = "bitcoin")]
     network: String,
 
- /// Esplora REST base URL. Default picks mempool.space's mainnet host.
- /// Combined with `--alchemy-key` for fallover (Alchemy first if set,
- /// mempool.space second). For self-hosted Esplora, point this at it.
- #[arg(long, env = "LUCKYPROTOCOL_ESPLORA")]
-    esplora: Option<String>,
+    /// Bitcoin Core JSON-RPC URL (e.g. `http://127.0.0.1:8332`).
+    /// REQUIRED — the indexer talks ONLY to your local Bitcoin Core
+    /// node. There is no third-party HTTP fallback. If the node is
+    /// unreachable, the indexer retries with backoff rather than
+    /// silently serving derived state from an unverified source.
+    /// Requires Core 24.0+ for `getblock <hash> 3` verbosity=3
+    /// (prevout metadata in vin).
+    #[arg(long, env = "LUCKYPROTOCOL_CORE_URL")]
+    core_url: String,
 
- /// Alchemy API key. When present, the indexer hits Alchemy's
- /// Bitcoin Esplora endpoint first and falls back to mempool.space
- /// (or the `--esplora` URL) on failure. Same pattern as the desktop
- /// app's chain.rs. Without this flag, only the Esplora URL is used.
- #[arg(long, env = "LUCKYPROTOCOL_ALCHEMY_KEY")]
-    alchemy_key: Option<String>,
+    /// Bitcoin Core RPC username (matches the node's `rpcuser` config).
+    #[arg(long, env = "LUCKYPROTOCOL_CORE_USER")]
+    core_user: String,
 
- /// Bitcoin Core JSON-RPC URL (e.g. `http://127.0.0.1:8332`). When
- /// set, the indexer hits the user's full node FIRST for every block
- /// fetch — one `getblock <hash> 3` call replaces ~50 Esplora page
- /// requests so backfill is dramatically faster. Requires Core 24.0+
- /// for verbosity=3 prevout metadata. On any RPC error / down node
- /// the indexer transparently falls back to alchemy → esplora chain,
- /// so this flag is safe to set even when the node is intermittently
- /// available. Auth via the `--core-user` + `--core-password` pair.
- #[arg(long, env = "LUCKYPROTOCOL_CORE_URL")]
-    core_url: Option<String>,
+    /// Bitcoin Core RPC password (matches the node's `rpcpassword`
+    /// config). For cookie auth, read the cookie file and pass
+    /// user=`__cookie__` + password=<contents-after-colon>.
+    #[arg(long, env = "LUCKYPROTOCOL_CORE_PASSWORD")]
+    core_password: String,
 
- /// Bitcoin Core RPC username (matches the node's `rpcuser` config).
- #[arg(long, env = "LUCKYPROTOCOL_CORE_USER")]
-    core_user: Option<String>,
-
- /// Bitcoin Core RPC password (matches the node's `rpcpassword`
- /// config). Required when `--core-url` is set; if you're using
- /// cookie auth, read the cookie file and pass user=__cookie__ +
- /// password=<contents-after-colon>.
- #[arg(long, env = "LUCKYPROTOCOL_CORE_PASSWORD")]
-    core_password: Option<String>,
-
- /// Start scanning from this block height. Defaults to the protocol
- /// activation height (LCKPROTOCOL_START_HEIGHT) so a fresh indexer
- /// indexes EVERY post-activation LUCKYPROTOCOL tx.
- #[arg(long, env = "LUCKYPROTOCOL_START_HEIGHT")]
+    /// Start scanning from this block height. Defaults to the protocol
+    /// activation height (LCKPROTOCOL_START_HEIGHT) so a fresh indexer
+    /// indexes EVERY post-activation LUCKYPROTOCOL tx.
+    #[arg(long, env = "LUCKYPROTOCOL_START_HEIGHT")]
     start_height: Option<u32>,
 
- /// HTTP server bind address.
- #[arg(long, env = "LUCKYPROTOCOL_BIND", default_value = "127.0.0.1:8765")]
+    /// HTTP server bind address.
+    #[arg(long, env = "LUCKYPROTOCOL_BIND", default_value = "127.0.0.1:8765")]
     bind: SocketAddr,
 
- /// Poll interval for new blocks (in seconds) once the indexer has
- /// caught up to chain tip. Lower = less lag between block arrival
- /// and indexer-side visibility, at the cost of more tip-height
- /// queries when idle. 10s gives ~5s expected lag (vs. ~15s at 30s)
- /// while staying well under Alchemy free-tier quota and any public
- /// Esplora mirror's per-IP rate limit. While behind (post-restart
- /// or after a network blip), the poller auto-overrides to 5s
- /// regardless of this value.
- #[arg(long, env = "LUCKYPROTOCOL_POLL_SECS", default_value = "10")]
+    /// Poll interval for new blocks (in seconds) once the indexer has
+    /// caught up to chain tip. Lower = less lag between block arrival
+    /// and indexer-side visibility, at the cost of more `getblockcount`
+    /// RPC calls. 10s gives ~5s expected lag at negligible local-node
+    /// load. While behind (post-restart or after a network blip), the
+    /// poller auto-overrides to 5s regardless of this value.
+    #[arg(long, env = "LUCKYPROTOCOL_POLL_SECS", default_value = "10")]
     poll_secs: u64,
 
- /// Path where the indexer dumps the latest state snapshot for
- /// warm-restart. Default puts it next to the binary as
- /// `luckyprotocol-indexer-snapshot.json`. Set to an empty string to
- /// disable snapshot persistence (purely in-memory mode — every
- /// restart re-scans from `--start-height`).
- #[arg(long, env = "LUCKYPROTOCOL_SNAPSHOT_PATH",
+    /// Path where the indexer dumps the latest state snapshot for
+    /// warm-restart. Default puts it next to the binary as
+    /// `luckyprotocol-indexer-snapshot.json`. Set to an empty string to
+    /// disable snapshot persistence (purely in-memory mode — every
+    /// restart re-scans from `--start-height`).
+    #[arg(long, env = "LUCKYPROTOCOL_SNAPSHOT_PATH",
         default_value = "luckyprotocol-indexer-snapshot.json")]
     snapshot_path: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
- // NON-BLOCKING TRACING WRITER.
- // We wrap stdout in `tracing_appender::non_blocking` so log calls
- // submit to a bounded channel + a dedicated worker thread, and
- // ALWAYS return immediately (typically <1µs). Without this, every
- // tracing::info! / warn! / error! is a synchronous write to stdout
- // — which, when the consumer (Tauri's sidecar drain task, or the
- // OS pipe buffer) is slow or wedged, BLOCKS the calling task
- // indefinitely. We've seen exactly that wedge: the poll loop
- // logged "indexing new blocks from=X to=X" then froze for 5+ hours
- // with HTTP /state still responsive but no further tracing
- // output. Worse, the v8 iteration watchdog couldn't surface the
- // wedge as a diagnostic event because its own `tracing::error!`
- // for the timeout was blocked on the same dead writer.
- // Capacity: default 128K-line channel. When/if the channel
- // fills (consumer too slow), the appender DROPS new lines rather
- // than blocking — so a slow downstream becomes "missing logs"
- // (visible in tracing's lost-line counter) instead of a hung
- // indexer. Tradeoff is correct: better to lose a few INFO lines
- // than to freeze the whole poll loop.
- // _guard must outlive `main` — `drop` flushes pending lines. We
- // bind to a top-level let so the destructor runs at end of main.
+    // NON-BLOCKING TRACING WRITER.
+    // We wrap stdout in `tracing_appender::non_blocking` so log calls
+    // submit to a bounded channel + a dedicated worker thread, and
+    // ALWAYS return immediately (typically <1µs). Without this, every
+    // tracing::info! / warn! / error! is a synchronous write to stdout
+    // — which, when the consumer (systemd-journald, the OS pipe buffer)
+    // is slow or wedged, BLOCKS the calling task indefinitely. We've
+    // seen exactly that wedge in the original Tauri sidecar wrapper.
+    // Capacity: default 128K-line channel. When/if the channel fills
+    // (consumer too slow), the appender DROPS new lines rather than
+    // blocking — so a slow downstream becomes "missing logs" (visible
+    // in tracing's lost-line counter) instead of a hung indexer.
+    // _guard must outlive `main` — `drop` flushes pending lines.
     let (non_blocking_writer, _tracing_guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -149,39 +133,27 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let network = source::parse_network(&cli.network)?;
-    let esplora_base = cli.esplora.clone().unwrap_or_else(|| source::default_esplora_for(network).to_string());
 
- // Bitcoin Core RPC config — set BEFORE backfill kicks off so the
- // first fetch already routes to the node. Empty / missing URL
- // skips the configuration (indexer behaves exactly as the pre-
- // Core-RPC version, walking the esplora chain).
-    if let Some(url) = cli.core_url.as_ref() {
-        let user = cli.core_user.clone().unwrap_or_default();
-        let password = cli.core_password.clone().unwrap_or_default();
-        if !url.trim().is_empty() {
-            let _ = core_rpc::CORE_RPC.set(core_rpc::CoreRpcConfig {
-                url: url.trim().to_string(),
-                user,
-                password,
-            });
-        }
-    }
+    // Bitcoin Core RPC config — set BEFORE backfill kicks off so the
+    // first fetch already routes to the node. clap enforces non-empty
+    // url/user/password (all three are required CLI args).
+    let _ = core_rpc::CORE_RPC.set(core_rpc::CoreRpcConfig {
+        url: cli.core_url.trim().to_string(),
+        user: cli.core_user.clone(),
+        password: cli.core_password.clone(),
+    });
 
-    tracing::info!(?network, esplora = %esplora_base,
-        alchemy = cli.alchemy_key.is_some(),
-        core_rpc = core_rpc::is_configured(),
-        "starting LUCKYPROTOCOL indexer");
+    tracing::info!(
+        ?network,
+        core_url = %cli.core_url,
+        "starting LUCKYPROTOCOL indexer (Core-only mode)"
+    );
 
- // PROCESS-LOCK SURROGATE — bind the HTTP port BEFORE any state
- // mutation. If another indexer is already running on this bind
- // address, TcpListener::bind fails with EADDRINUSE; we surface
- // that as a clean exit message rather than racing with the other
- // instance over the snapshot file. Doing the bind here (instead
- // of inside server::serve as before) means we never load + write
- // a snapshot under a double-spawn condition. This is cross-
- // platform and requires no extra deps; see also the
- // LUCKYPROTOCOL_BIND env var for choosing a different port if you
- // intentionally want two indexers.
+    // PROCESS-LOCK SURROGATE — bind the HTTP port BEFORE any state
+    // mutation. If another indexer is already running on this bind
+    // address, TcpListener::bind fails with EADDRINUSE; we surface
+    // that as a clean exit message rather than racing with the other
+    // instance over the snapshot file.
     let listener = match tokio::net::TcpListener::bind(cli.bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -193,9 +165,9 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(bind = %cli.bind, "process-lock listener bound — proceeding with snapshot load");
 
- // Configure snapshot persistence path before any backfill kicks off
- // so the trigger inside backfill_range can fire on the very first
- // SNAPSHOT_INTERVAL_BLOCKS-aligned block.
+    // Configure snapshot persistence path before any backfill kicks off
+    // so the trigger inside backfill_range can fire on the very first
+    // SNAPSHOT_INTERVAL_BLOCKS-aligned block.
     let snapshot_path: Option<PathBuf> = if cli.snapshot_path.trim().is_empty() {
         None
     } else {
@@ -204,24 +176,24 @@ async fn main() -> anyhow::Result<()> {
         Some(p)
     };
 
-    let mut state_init = indexer::IndexerState::new(network, esplora_base.clone());
+    let mut state_init = indexer::IndexerState::new(network);
 
- // Attempt warm-restart from disk snapshot. Failure here just falls
- // through to a cold scan — never fatal.
- // CRITICAL: before accepting the snapshot, validate its tail block
- // hashes against the current canonical chain. If even one diverges,
- // a reorg happened while we were down and any indexed BET / SEND /
- // DEPLOY in the orphaned blocks must NOT be replayed back into
- // state — refuse the snapshot, cold-scan instead.
+    // Attempt warm-restart from disk snapshot. Failure here just falls
+    // through to a cold scan — never fatal.
+    // CRITICAL: before accepting the snapshot, validate its tail block
+    // hashes against the current canonical chain (per Bitcoin Core). If
+    // even one diverges, a reorg happened while we were down and any
+    // indexed BET / SEND / DEPLOY in the orphaned blocks must NOT be
+    // replayed back into state — refuse the snapshot, cold-scan instead.
     let mut warm_started_at: Option<u32> = None;
     if let Some(p) = snapshot_path.as_ref() {
         match try_load_snapshot(p).await {
             Ok(Some(snap)) => {
- // Schema version gate: snapshots from a previous protocol
- // cohort (different SNAPSHOT_VERSION, including any legacy
- // BTCASINO cohort) carry state from blocks that are now
- // pre-activation. Refuse them so a clean cold-scan re-derives
- // the canonical state from the new activation height.
+                // Schema version gate: snapshots from a previous protocol
+                // cohort (different SNAPSHOT_VERSION) carry state from
+                // blocks that are now pre-activation. Refuse them so a
+                // clean cold-scan re-derives the canonical state from
+                // the new activation height.
                 if snap.version != indexer::SNAPSHOT_VERSION {
                     tracing::warn!(
                         snapshot_version = snap.version,
@@ -233,11 +205,9 @@ async fn main() -> anyhow::Result<()> {
                         tracing::warn!(error = ?e, "failed to remove stale-version snapshot file");
                     }
                 } else {
-                    let valid = source::validate_snapshot_against_canonical(
-                        &snap, network, cli.alchemy_key.as_deref(),
-                    )
-                    .await
-                    .unwrap_or(false);
+                    let valid = source::validate_snapshot_against_canonical(&snap)
+                        .await
+                        .unwrap_or(false);
                     if valid {
                         let h = snap.indexed_height;
                         state_init.restore_from_snapshot(snap);
@@ -247,9 +217,6 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         tracing::warn!(snapshot_path = %p.display(),
                             "snapshot tail diverges from canonical chain — refusing warm-restart, cold-scanning");
- // Drop the stale file so future restarts don't keep
- // rejecting the same bytes. The indexer will produce
- // a fresh snapshot once cold-scan completes.
                         if let Err(e) = tokio::fs::remove_file(p).await {
                             tracing::warn!(error = ?e, "failed to remove stale snapshot file");
                         }
@@ -269,36 +236,23 @@ async fn main() -> anyhow::Result<()> {
 
     let state = std::sync::Arc::new(parking_lot::RwLock::new(state_init));
 
- // Plumb the alchemy key + esplora URL into source.rs so its
- // fetch_* helpers can use the alchemy-first / esplora-fallback
- // ordering. Set ONCE at boot — never mutated thereafter. Empty
- // strings from the sidecar (always-emit-all-args strategy) are
- // treated as "not set".
-    if let Some(key) = cli.alchemy_key.clone() {
-        let trimmed = key.trim().to_string();
-        if !trimmed.is_empty() {
-            let _ = source::ALCHEMY_KEY.set(trimmed);
-        }
-    }
-
- // Event-driven wake handle — shared between the run_poller's
- // tokio::select! and the HTTP server's POST /poll-now handler.
- // Created here (not inside run_poller) so server::set_poll_notify
- // can register a clone BEFORE the HTTP server starts accepting
- // requests. Notify's 1-permit semantics + the debounce on the
- // handler side keep this safe against burst calls.
+    // Event-driven wake handle — shared between the run_poller's
+    // tokio::select! and the HTTP server's POST /poll-now handler.
+    // Created here (not inside run_poller) so server::set_poll_notify
+    // can register a clone BEFORE the HTTP server starts accepting
+    // requests.
     let poll_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     server::set_poll_notify(poll_notify.clone());
 
- // Background poller — does the initial backfill (from snapshot height
- // if warm-started, else from --start-height / activation) then keeps
- // up with the tip.
+    // Background poller — does the initial backfill (from snapshot height
+    // if warm-started, else from --start-height / activation) then keeps
+    // up with the tip.
     let state_for_poll = state.clone();
     let effective_start = match (warm_started_at, cli.start_height) {
- // Warm restart wins — pick up where the snapshot left off.
+        // Warm restart wins — pick up where the snapshot left off.
         (Some(h), _) => Some(h + 1),
- // Cold scan — honor --start-height if given, else default in source.rs
- // (= LCKPROTOCOL_START_HEIGHT).
+        // Cold scan — honor --start-height if given, else default in source.rs
+        // (= LCKPROTOCOL_START_HEIGHT).
         (None, override_h) => override_h,
     };
     let poll_notify_for_loop = poll_notify.clone();
@@ -310,15 +264,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
- // HTTP server — listener was bound at the top of main() as a
- // process-lock surrogate, so this just consumes it and serves.
+    // HTTP server — listener was bound at the top of main() as a
+    // process-lock surrogate, so this just consumes it and serves.
     server::serve(state, listener).await
 }
 
 /// Best-effort load of the on-disk JSON snapshot. Returns:
-/// Ok(Some) — snapshot loaded successfully
-/// Ok(None) — file doesn't exist (first run / snapshot disabled)
-/// Err — file existed but parse / IO failed (caller logs + falls back)
+///   Ok(Some) — snapshot loaded successfully
+///   Ok(None) — file doesn't exist (first run / snapshot disabled)
+///   Err     — file existed but parse / IO failed (caller logs + falls back)
 async fn try_load_snapshot(
     path: &std::path::Path,
 ) -> anyhow::Result<Option<indexer::StateSnapshot>> {

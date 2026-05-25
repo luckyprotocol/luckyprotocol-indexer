@@ -316,7 +316,6 @@ pub struct StateSnapshot {
 
 pub struct IndexerState {
     pub network: Network,
-    pub esplora_base: String,
     pub indexed_height: u32,
     pub tip_height: u32,
  /// UTXO-bound balances — see StateSnapshot.utxo_balances.
@@ -387,10 +386,9 @@ pub struct TxContext<'a> {
 }
 
 impl IndexerState {
-    pub fn new(network: Network, esplora_base: String) -> Self {
+    pub fn new(network: Network) -> Self {
         Self {
             network,
-            esplora_base,
             indexed_height: 0,
             tip_height: 0,
             utxo_balances: HashMap::new(),
