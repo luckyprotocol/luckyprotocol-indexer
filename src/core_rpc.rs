@@ -21,10 +21,20 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-/// Per-request timeout. Local-network RPC is fast; 8s catches the
-/// pathological case where the user pointed `--core-url` at a remote
-/// node that's down without stalling the pipeline.
+/// Per-request timeout for the SHORT RPCs — `getblockcount`,
+/// `getblockhash`, `getblock <hash> 3`. All of these return within
+/// ~10 ms on a localhost node; 8s catches the pathological case
+/// where the node is wedged without stalling the indexer's poll loop.
 const RPC_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Per-request timeout for LONG-running RPCs — currently just
+/// `scantxoutset`, which iterates the full UTXO set (~165 M entries
+/// on mainnet) and takes 1-3 minutes depending on disk speed.
+/// Padded to 5 minutes so a node under concurrent load still has
+/// headroom. Any call wedged past this is genuinely broken and we
+/// don't want to block forever waiting on it — surface as a 502
+/// to the caller so they retry next poll.
+const RPC_TIMEOUT_LONG: Duration = Duration::from_secs(300);
 
 /// Global Bitcoin Core RPC configuration, set once by `main.rs` from
 /// the required `--core-url` / `--core-user` / `--core-password` CLI
@@ -70,6 +80,23 @@ async fn call<T>(
 where
     T: serde::de::DeserializeOwned,
 {
+    call_with_timeout(client, cfg, method, params, RPC_TIMEOUT).await
+}
+
+/// Variant of `call` that lets the caller pick the per-request timeout
+/// — needed for `scantxoutset` and other long-running RPCs that would
+/// otherwise hit the 8s ceiling baked into `RPC_TIMEOUT`. Same body
+/// shape, same error mapping; only the request timeout differs.
+async fn call_with_timeout<T>(
+    client: &reqwest::Client,
+    cfg: &CoreRpcConfig,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
     let body = json!({
         "jsonrpc": "1.0",
         "id": "luckyprotocol-indexer",
@@ -79,7 +106,7 @@ where
     let resp = client
         .post(&cfg.url)
         .basic_auth(&cfg.user, Some(&cfg.password))
-        .timeout(RPC_TIMEOUT)
+        .timeout(timeout)
         .json(&body)
         .send()
         .await
@@ -232,8 +259,13 @@ pub async fn scan_tx_out_set_for_address(
     // standard address type Bitcoin Core understands (p2pkh, p2sh,
     // p2wpkh, p2wsh, p2tr).
     let descriptors = json!([{ "desc": format!("addr({})", address) }]);
-    let res: ScanTxOutResult = call(
-        client, cfg, "scantxoutset", json!(["start", descriptors]),
+    // Use the LONG timeout — scantxoutset walks the full UTXO set
+    // and routinely takes 1-3 minutes on mainnet. The general
+    // RPC_TIMEOUT (8 s) would chop this off mid-scan and surface as
+    // an "error sending request" before any data flows back; the
+    // POST request stays open the entire scan duration.
+    let res: ScanTxOutResult = call_with_timeout(
+        client, cfg, "scantxoutset", json!(["start", descriptors]), RPC_TIMEOUT_LONG,
     ).await?;
     Ok(res)
 }
