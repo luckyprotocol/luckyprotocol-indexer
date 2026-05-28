@@ -870,11 +870,23 @@ async fn bet_by_txid(
 //
 // Shared resources for the proxy handlers:
 //
-//   * RPC_CLIENT  — one process-global reqwest::Client. Reused across
-//     requests so connection pooling + TLS sessions amortize.
-//   * SCAN_LOCK   — Tokio mutex serializing scantxoutset calls. bitcoind
-//     itself rejects concurrent scans with "Scan already in progress",
-//     so we queue them client-side instead of returning errors.
+//   * RPC_CLIENT  — one process-global reqwest::Client tuned for the
+//     long-tail RPCs (scantxoutset can take 60-180 seconds on a busy
+//     node). Connection POOLING IS DISABLED — bitcoind's default
+//     `rpcservertimeout` is 30 seconds, so an idle pooled connection
+//     dies on bitcoind's side faster than reqwest knows, and the next
+//     request fails with "error sending request" before it can even
+//     get to the slow scan. Fresh TCP per request adds ~1ms of
+//     localhost connect overhead — negligible compared to a multi-
+//     minute scantxoutset.
+//   * SCAN_LOCK   — Tokio mutex serializing scantxoutset calls.
+//     bitcoind itself rejects concurrent scans with "Scan already in
+//     progress", so we queue them client-side. Equally importantly,
+//     if a caller (e.g., a curl with a broken pipe) drops their HTTP
+//     connection mid-scan, bitcoind's scan continues to completion;
+//     next request would find a leftover scan from the previous
+//     orphaned attempt. The mutex hold doesn't fix that — but it does
+//     ensure we never INITIATE a second scan while one is running.
 //
 // Both live as `OnceLock`s rather than `static`s so initialization is
 // lazy (no Tokio runtime needed before first call).
@@ -885,10 +897,20 @@ static SCAN_LOCK:  std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::Once
 fn rpc_client() -> &'static reqwest::Client {
     RPC_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120)) // scantxoutset can take ~1 min on a cold node
+            // Generous overall timeout — scantxoutset on a 165M-UTXO
+            // mainnet set takes ~2 minutes; we pad to 5 minutes so a
+            // node under load doesn't squeak past the limit.
+            .timeout(std::time::Duration::from_secs(300))
             .user_agent(concat!("luckyprotocol-indexer/", env!("CARGO_PKG_VERSION")))
             .tcp_nodelay(true)
-            .pool_idle_timeout(std::time::Duration::from_secs(180))
+            // KILL CONNECTION POOLING. Default keep-alive is 90s and
+            // bitcoind's default rpcservertimeout is 30s — any cached
+            // connection dies on bitcoind's side before we can reuse
+            // it, surfacing as "error sending request for url" on the
+            // next call. Going pool-less means every RPC pays a fresh
+            // TCP connect + auth round trip (~1ms locally) but the
+            // request itself reliably gets a live socket.
+            .pool_max_idle_per_host(0)
             .build()
             .expect("reqwest::Client build")
     })
